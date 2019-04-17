@@ -15,26 +15,15 @@
  ********************************************************************************/
 
 import { injectable } from 'inversify';
-import URI from '@theia/core/lib/common/uri';
 import { FolderPreferenceProvider } from './folder-preference-provider';
 
 @injectable()
 export class FolderLaunchPreferenceProvider extends FolderPreferenceProvider {
 
-    async getUri(): Promise<URI | undefined> {
-        this.folderUri = new URI(this.options.folder.uri);
-        if (await this.fileSystem.exists(this.folderUri.toString())) {
-            const uri = this.folderUri.resolve('.theia').resolve('launch.json');
-            return uri;
-        }
-    }
-
     // tslint:disable-next-line:no-any
     protected parse(content: string): any {
-        const parsedData = super.parse(content);
-        if (!!parsedData && Object.keys(parsedData).length > 0) {
-            return { launch: parsedData };
-        }
-        return parsedData;
+        const launch = super.parse(content);
+        return launch ? { launch } : {};
     }
+
 }

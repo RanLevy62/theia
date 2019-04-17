@@ -37,8 +37,7 @@ export interface PreferenceChange {
 
 export class PreferenceChangeImpl implements PreferenceChange {
     constructor(
-        private change: PreferenceProviderDataChange,
-        private providers: Map<PreferenceScope, PreferenceProvider>
+        private change: PreferenceProviderDataChange
     ) { }
 
     get preferenceName() {
@@ -51,33 +50,21 @@ export class PreferenceChangeImpl implements PreferenceChange {
         return this.change.oldValue;
     }
 
+    // TODO add tests
     affects(resourceUri?: string): boolean {
-        if (this.change.domain && resourceUri &&
-            this.change.domain.length !== 0 &&
-            this.change.domain.map(uriStr => new URI(uriStr))
-                .every(folderUri => folderUri.path.relativity(new URI(resourceUri).path) < 0)
-        ) {
-            return false;
-        }
-        for (const [scope, provider] of this.providers.entries()) {
-            if (!resourceUri && scope === PreferenceScope.Folder) {
-                continue;
-            }
-            const providerInfo = provider.canProvide(this.preferenceName, resourceUri);
-            const priority = providerInfo.priority;
-            if (priority >= 0 && scope > this.change.scope) {
-                return false;
-            }
-            if (scope === this.change.scope && this.change.domain.some(d => providerInfo.provider.getDomain().findIndex(pd => pd === d) < 0)) {
-                return false;
-            }
-        }
-        return true;
+        const resourcePath = resourceUri && new URI(resourceUri).path;
+        const domain = this.change.domain;
+        return !resourcePath || !domain || domain.some(uri => new URI(uri).path.relativity(resourcePath) >= 0);
     }
 }
 
 export interface PreferenceChanges {
     [preferenceName: string]: PreferenceChange
+}
+
+export interface PreferenceResolveResult<T> {
+    configUri?: URI
+    value?: T
 }
 
 export const PreferenceService = Symbol('PreferenceService');
@@ -87,11 +74,21 @@ export interface PreferenceService extends Disposable {
     get<T>(preferenceName: string, defaultValue: T): T;
     get<T>(preferenceName: string, defaultValue: T, resourceUri: string): T;
     get<T>(preferenceName: string, defaultValue?: T, resourceUri?: string): T | undefined;
-    set(preferenceName: string, value: any, scope?: PreferenceScope, resourceUri?: string): Promise<void>;
+    set(preferenceName: string, value: any, scope?: PreferenceScope, resourceUri?: string): Promise<boolean>;
     onPreferenceChanged: Event<PreferenceChange>;
+
+    inspect<T>(preferenceName: string, resourceUri?: string): {
+        preferenceName: string,
+        defaultValue: T | undefined,
+        globalValue: T | undefined, // User Preference
+        workspaceValue: T | undefined, // Workspace Preference
+        workspaceFolderValue: T | undefined // Folder Preference
+    } | undefined;
 
     overridePreferenceName(options: OverridePreferenceName): string;
     overridenPreferenceName(preferenceName: string): OverridePreferenceName | undefined;
+
+    resolve<T>(preferenceName: string, defaultValue?: T, resourceUri?: string): PreferenceResolveResult<T>;
 }
 
 /**
@@ -128,7 +125,7 @@ export class PreferenceServiceImpl implements PreferenceService, FrontendApplica
 
     @postConstruct()
     protected init(): void {
-        this.toDispose.push(Disposable.create(() => this._ready.reject()));
+        this.toDispose.push(Disposable.create(() => this._ready.reject(new Error('preference service is disposed'))));
         this.doSetProvider(PreferenceScope.Default, this.schema);
     }
 
@@ -177,7 +174,7 @@ export class PreferenceServiceImpl implements PreferenceService, FrontendApplica
         const changesToEmit: PreferenceChanges = {};
         const acceptChange = (change: PreferenceProviderDataChange) =>
             this.getAffectedPreferenceNames(change, preferenceName =>
-                changesToEmit[preferenceName] = new PreferenceChangeImpl({ ...change, preferenceName }, this.providersMap)
+                changesToEmit[preferenceName] = new PreferenceChangeImpl({ ...change, preferenceName })
             );
         if (changes) {
             for (const preferenceName of Object.keys(changes)) {
@@ -255,12 +252,8 @@ export class PreferenceServiceImpl implements PreferenceService, FrontendApplica
         this.toDispose.push(provider);
     }
 
-    protected getProvider(scope: PreferenceScope, preferenceName?: string, resourceUri?: string): PreferenceProvider | undefined {
-        const provider = this.providersMap.get(scope);
-        if (provider && (!preferenceName || provider.canProvide(preferenceName, resourceUri).priority >= 0)) {
-            return provider;
-        }
-        return undefined;
+    protected getProvider(scope: PreferenceScope): PreferenceProvider | undefined {
+        return this.providersMap.get(scope);
     }
 
     getPreferences(resourceUri?: string): { [key: string]: any } {
@@ -280,21 +273,29 @@ export class PreferenceServiceImpl implements PreferenceService, FrontendApplica
     get<T>(preferenceName: string, defaultValue: T, resourceUri: string): T;
     get<T>(preferenceName: string, defaultValue?: T, resourceUri?: string): T | undefined;
     get<T>(preferenceName: string, defaultValue?: T, resourceUri?: string): T | undefined {
-        const value = this.doGet(preferenceName, defaultValue, resourceUri);
+        return this.resolve<T>(preferenceName, defaultValue, resourceUri).value;
+    }
+
+    resolve<T>(preferenceName: string, defaultValue?: T, resourceUri?: string): {
+        configUri?: URI,
+        value?: T
+    } {
+        const { value, configUri } = this.doResolve(preferenceName, defaultValue, resourceUri);
         if (value === null || value === undefined) {
             const overriden = this.overridenPreferenceName(preferenceName);
             if (overriden) {
-                return this.doGet(overriden.preferenceName, defaultValue, resourceUri);
+                return this.doResolve(overriden.preferenceName, defaultValue, resourceUri);
             }
         }
-        return value;
+        return { value, configUri };
     }
 
-    async set(preferenceName: string, value: any, scope: PreferenceScope = PreferenceScope.User, resourceUri?: string): Promise<void> {
+    async set(preferenceName: string, value: any, scope: PreferenceScope = PreferenceScope.User, resourceUri?: string): Promise<boolean> {
         const provider = this.getProvider(scope);
         if (provider) {
-            await provider.setPreference(preferenceName, value, resourceUri);
+            return provider.setPreference(preferenceName, value, resourceUri);
         }
+        return false;
     }
 
     getBoolean(preferenceName: string): boolean | undefined;
@@ -369,20 +370,43 @@ export class PreferenceServiceImpl implements PreferenceService, FrontendApplica
         return this.doGet(preferenceName, undefined, resourceUri) !== undefined;
     }
     protected doInspectInScope<T>(preferenceName: string, scope: PreferenceScope, resourceUri?: string): T | undefined {
-        const provider = this.getProvider(scope, preferenceName, resourceUri);
+        const provider = this.getProvider(scope);
         return provider && provider.get<T>(preferenceName, resourceUri);
     }
     protected doGet<T>(preferenceName: string, defaultValue?: T, resourceUri?: string): T | undefined {
+        return this.doResolve(preferenceName, defaultValue, resourceUri).value;
+    }
+    protected doResolve<T>(preferenceName: string, defaultValue?: T, resourceUri?: string): {
+        configUri?: URI
+        value?: T
+    } {
         for (const scope of PreferenceScope.getReversedScopes()) {
             if (this.schema.isValidInScope(preferenceName, scope)) {
-                const provider = this.getProvider(scope, preferenceName, resourceUri);
+                const provider = this.getProvider(scope);
                 if (provider) {
-                    const value = provider.get<T>(preferenceName, resourceUri);
-                    const result = value !== null && value !== undefined ? value : defaultValue;
-                    return deepFreeze(result);
+                    const result = provider.resolve<T>(preferenceName, resourceUri);
+                    if (result.value !== null && result.value !== undefined) {
+                        return this.toResolveResult(preferenceName, result);
+                    }
                 }
             }
         }
+        return this.toResolveResult(preferenceName, { value: defaultValue });
+    }
+    protected toResolveResult<T>(preferenceName: string, { configUri, value }: PreferenceResolveResult<T>): PreferenceResolveResult<T> {
+        let result: any = value;
+        if (preferenceName === 'launch' && typeof result === 'object') {
+            if (!('configurations' in result)) {
+                result = { ...result, configurations: [] };
+            }
+            if (!('compounds' in result)) {
+                result = { ...result, compounds: [] };
+            }
+        }
+        return {
+            configUri,
+            value: deepFreeze(result)
+        };
     }
 
 }
